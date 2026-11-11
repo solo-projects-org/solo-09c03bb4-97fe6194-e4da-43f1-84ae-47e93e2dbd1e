@@ -279,6 +279,15 @@
     font-size: 12px;
     user-select: none;
   }
+  .path-toggle {
+    color: var(--primary);
+    cursor: pointer;
+    font-size: 12px;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .path-toggle:hover { text-decoration: underline; }
+  .path-row td { background: #fcfdff; border-bottom: 1px solid #f0f2f6; }
   .upstream-trees { font-size: 12px; color: #475467; margin-top: 8px; }
   .loading-mask {
     display: none;
@@ -316,6 +325,7 @@
       <h2><span class="step-badge">1</span>载入字段清单与模型 SQL</h2>
       <div class="btn-row">
         <button class="btn" id="btn-sample">载入清分样例</button>
+        <button class="btn" id="btn-longchain">载入长链样例</button>
         <label class="btn" style="margin:0">
           上传 JSON
           <input type="file" id="file-input" accept=".json,application/json" hidden>
@@ -348,7 +358,7 @@
     <div id="result-body">
       <div class="empty">
         <div class="big">🔍</div>
-        <div>载入 JSON 并选择待调整字段后，在此查看受影响的模型列<br>及每列一条可回溯到源表的依赖路径。</div>
+        <div>载入 JSON 并选择待调整字段后，在此查看受影响的模型列；<br>点开某列即可展开从源字段到该列的一条完整依赖路径。</div>
       </div>
     </div>
   </div>
@@ -389,7 +399,11 @@ async function postJSON(url, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return resp.json();
+  try {
+    return await resp.json();
+  } catch (err) {
+    return { ok: false, error: `服务异常（HTTP ${resp.status}），请查看服务端日志。` };
+  }
 }
 
 async function loadPayload(data, label) {
@@ -437,13 +451,17 @@ function renderTableSelect() {
 
 function renderModelDeps() {
   if (!modelDeps.length) { $("model-deps").innerHTML = ""; return; }
-  $("model-deps").innerHTML = "<div style='margin-bottom:6px;color:#667085'>模型读取关系：</div>" +
-    modelDeps.map(m => {
-      const ups = m.upstream.length
-        ? m.upstream.map(u => `<span class="model-chip">${escapeHtml(u)}</span>`).join("")
-        : '<span class="model-chip">仅源表</span>';
-      return `<div style="margin:4px 0"><span class="model-chip" style="background:#e8efff;color:#1849a9">${escapeHtml(m.name)}</span><span class="arr">←</span>${ups}</div>`;
-    }).join("");
+  const MAX = 30;
+  const rows = modelDeps.slice(0, MAX).map(m => {
+    const ups = m.upstream.length
+      ? m.upstream.map(u => `<span class="model-chip">${escapeHtml(u)}</span>`).join("")
+      : '<span class="model-chip">仅源表</span>';
+    return `<div style="margin:4px 0"><span class="model-chip" style="background:#e8efff;color:#1849a9">${escapeHtml(m.name)}</span><span class="arr">←</span>${ups}</div>`;
+  }).join("");
+  const more = modelDeps.length > MAX
+    ? `<div class="meta-line">… 共 ${modelDeps.length} 个模型，仅列出前 ${MAX} 个</div>` : "";
+  $("model-deps").innerHTML =
+    "<div style='margin-bottom:6px;color:#667085'>模型读取关系：</div>" + rows + more;
 }
 
 function renderFieldList() {
@@ -503,6 +521,17 @@ $("btn-sample").addEventListener("click", async () => {
   }
 });
 
+$("btn-longchain").addEventListener("click", async () => {
+  setLoading(true, "载入长链清分样例…");
+  try {
+    const resp = await fetch("/api/sample/longchain");
+    const data = await resp.json();
+    await loadPayload(data, `长链清分样例（${data.models.length} 个模型逐层引用）`);
+  } finally {
+    setLoading(false);
+  }
+});
+
 $("btn-analyze").addEventListener("click", async () => {
   if (!targetTable || !targetColumn) return;
   setLoading(true, "血缘传播分析中…");
@@ -527,6 +556,20 @@ function viaTag(via) {
   return `<span class="tag ${cls}">${lbl}</span>`;
 }
 
+// 路径步骤登记表：服务端对多条路径共用的前缀只传输一份，
+// 每列的 path_id 指向最后一步，沿 prev 回溯即可还原完整路径。
+let stepById = {};
+
+function expandPath(pathId) {
+  const out = [];
+  let cur = stepById[pathId];
+  while (cur) {
+    out.push(cur);
+    cur = cur.prev === null || cur.prev === undefined ? null : stepById[cur.prev];
+  }
+  return out.reverse();
+}
+
 function renderPath(path) {
   return `<div class="path-chain">` + path.map((step, i) => {
     if (step.type === "source") {
@@ -543,12 +586,34 @@ function renderPath(path) {
   }).join("") + `</div>`;
 }
 
+// 点开某列再展开从源字段到该列的一条完整路径（事件委托，长链报告也流畅）
+$("result-body").addEventListener("click", (e) => {
+  const toggle = e.target.closest(".path-toggle");
+  if (!toggle) return;
+  const row = toggle.closest("tr");
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains("path-row")) {
+    next.remove();
+    toggle.textContent = "▸ 依赖路径";
+    return;
+  }
+  const steps = expandPath(Number(toggle.dataset.pathId));
+  const tr = document.createElement("tr");
+  tr.className = "path-row";
+  tr.innerHTML = `<td colspan="3">${renderPath(steps)}</td>`;
+  row.parentNode.insertBefore(tr, row.nextSibling);
+  toggle.textContent = "▾ 收起路径";
+});
+
 function renderResult(r) {
+  stepById = {};
+  (r.path_steps || []).forEach(s => { stepById[s.id] = s; });
   if (!r.affected_models.length) {
     $("result-body").innerHTML = `<div class="empty"><div class="big">🫙</div>
       <div>字段 <code>${escapeHtml(r.target.table)}.${escapeHtml(r.target.column)}</code><br>未被任何模型读取，没有受影响的输出列。</div></div>`;
     return;
   }
+
   const stats = `
     <div class="stats">
       <div class="stat"><div class="num">${r.model_count}</div><div class="lbl">受影响模型</div></div>
@@ -558,7 +623,8 @@ function renderResult(r) {
     <div class="alert alert-info">
       <span>🎯</span>
       <span>起点字段：<b>${escapeHtml(r.target.table)}.${escapeHtml(r.target.column)}</b>。
-      字段进入 JOIN ON / WHERE（含 IN 子查询）时，该查询及其下游实际读取者的<b>全部输出列</b>按条件污染标出。</span>
+      字段进入 JOIN ON / WHERE（含 IN 子查询）时，该查询及其下游实际读取者的<b>全部输出列</b>按条件污染标出。
+      点击列右侧「依赖路径」展开从源字段到该列的一条完整路径。</span>
     </div>`;
 
   const cards = r.affected_models.map(m => `
@@ -573,13 +639,13 @@ function renderResult(r) {
         </span>
       </div>
       <table class="col-table">
-        <thead><tr><th style="width:170px">受影响输出列</th><th style="width:90px">依赖方式</th><th>一条依赖路径（回溯至源表）</th></tr></thead>
+        <thead><tr><th style="width:220px">受影响输出列</th><th style="width:90px">依赖方式</th><th>依赖路径（点击展开，回溯至源表）</th></tr></thead>
         <tbody>
           ${m.columns.map(c => `
             <tr>
               <td class="col-name">${escapeHtml(c.column)}</td>
               <td>${viaTag(c.via)}</td>
-              <td>${renderPath(c.path)}</td>
+              <td><span class="path-toggle" data-path-id="${c.path_id}">▸ 依赖路径</span></td>
             </tr>`).join("")}
         </tbody>
       </table>

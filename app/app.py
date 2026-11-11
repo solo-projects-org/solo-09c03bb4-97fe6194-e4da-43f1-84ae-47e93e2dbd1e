@@ -51,6 +51,66 @@ def sample():
     return jsonify(payload)
 
 
+def _longchain_sample(depth: int = 1200) -> dict:
+    """长依赖链清分样例：depth 个模型逐层引用，验证长链分析与传输。
+
+    每 300 层安排一次 WHERE 条件污染，末端结算层关联线路维度并按
+    换乘标志筛选，覆盖值传递与条件污染两种标记。
+    """
+    source_tables = [
+        {"table": "ods_card_transaction",
+         "columns": ["transaction_id", "card_id", "line_id", "vehicle_id",
+                     "transaction_time", "amount", "transfer_flag", "city_code"]},
+        {"table": "dim_bus_line",
+         "columns": ["line_id", "line_name", "line_type", "company_id"]},
+    ]
+    select_cols = (
+        "p.transaction_id AS transaction_id, p.line_id AS line_id, "
+        "p.amount AS amount, p.transfer_flag AS transfer_flag"
+    )
+
+    def chain_name(i: int) -> str:
+        return f"dwd_transfer_chain_{i:04d}"
+
+    models = [{
+        "name": chain_name(1),
+        "description": "长链第 1 层：读取刷卡交易源表",
+        "sql": "SELECT t.transaction_id AS transaction_id, t.line_id AS line_id, "
+               "t.amount AS amount, t.transfer_flag AS transfer_flag "
+               "FROM ods_card_transaction t",
+    }]
+    for i in range(2, depth + 1):
+        sql = f"SELECT {select_cols} FROM {chain_name(i - 1)} p"
+        if i % 300 == 0:
+            sql += " WHERE p.transfer_flag = 0"
+        models.append({
+            "name": chain_name(i),
+            "description": f"长链第 {i} 层：逐层引用上一层"
+                           + ("，本层按换乘标志筛选（条件污染）" if i % 300 == 0 else ""),
+            "sql": sql,
+        })
+    models.append({
+        "name": "ads_transfer_settlement_chain",
+        "description": "长链末端结算层：关联线路维度，按换乘标志筛出结算列",
+        "sql": f"SELECT p.line_id AS line_id, l.line_name AS line_name, "
+               f"l.company_id AS company_id, p.transfer_flag AS transfer_flag, "
+               f"p.amount AS settlement_amount "
+               f"FROM {chain_name(depth)} p "
+               f"INNER JOIN dim_bus_line l ON p.line_id = l.line_id "
+               f"WHERE p.transfer_flag = 1",
+    })
+    return {
+        "scenario": f"公交清分数仓 · 长依赖链样例（{depth} 个模型逐层引用 + 结算层）",
+        "source_tables": source_tables,
+        "models": models,
+    }
+
+
+@app.get("/api/sample/longchain")
+def sample_longchain():
+    return jsonify(_longchain_sample())
+
+
 @app.post("/api/validate")
 def validate():
     """校验上传的 JSON 并返回字段清单，供前端选择待改字段。"""

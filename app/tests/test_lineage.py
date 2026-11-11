@@ -17,6 +17,18 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
+def expand(result, col_entry):
+    """把压缩传输的路径（path_id 指向 path_steps 最后一步）还原为完整步骤列表。"""
+    steps = result["path_steps"]
+    out = []
+    cur = col_entry["path_id"]
+    while cur is not None:
+        out.append(steps[cur])
+        cur = steps[cur]["prev"]
+    out.reverse()
+    return out
+
+
 def base_sources():
     return [
         {"table": "t_a", "columns": ["id", "flag", "val", "grp"]},
@@ -80,7 +92,7 @@ check("跨模型-未读取不受影响", "m2" not in by_model)
 check("跨模型-读取者受影响",
       "m3" in by_model and {c["column"] for c in by_model["m3"]["columns"]} == {"flag"})
 # m3 路径应跨模型回到源表
-path = by_model["m3"]["columns"][0]["path"]
+path = expand(r, by_model["m3"]["columns"][0])
 check("跨模型-路径回到源表",
       path[0]["type"] == "source" and path[0]["relation"] == "t_a" and path[0]["column"] == "flag")
 check("跨模型-路径含上游模型步骤",
@@ -101,7 +113,7 @@ check("条件污染下游-全部输出", set(c["column"] for c in by_model["m2"]
 # 因此 m2 根查询的条件集合同样命中；路径中应能看到来自 m1 的 condition 步骤
 check("条件污染下游-m2条件查询被标注", by_model["m2"]["condition_queries"] == ["m2"])
 check("条件污染下游-m2继承condition路径",
-      all(any(s.get("via") == "condition" for s in c["path"])
+      all(any(s.get("via") == "condition" for s in expand(r, c))
           for c in by_model["m2"]["columns"]))
 
 # 6. CTE 内部条件污染 ----------------------------------------------------------------
@@ -126,7 +138,7 @@ r = analyze(p, "t_a", "flag")
 m = r["affected_models"][0]
 cols = {c["column"]: c for c in m["columns"]}
 check("多层CTE-仅值列受影响", set(cols) == {"out_flag"})
-chain = [s.get("query") for s in cols["out_flag"]["path"] if s["type"] == "node"]
+chain = [s.get("query") for s in expand(r, cols["out_flag"]) if s["type"] == "node"]
 check("多层CTE-路径经过c1/c2/root", chain == ["c1", "c2", "m1"], str(chain))
 
 # 8. 未限定列名 → 报错并指出模型 ----------------------------------------------------------------
@@ -292,7 +304,7 @@ r = analyze(sample, "ods_card_transaction", "transfer_flag")
 check("样例-3个模型全部受影响", r["model_count"] == 3)
 check("样例-19个输出列受影响", r["column_count"] == 19)
 # 每个路径都能回溯到源表种子
-ok = all(c["path"][0]["type"] == "source"
+ok = all(expand(r, c)[0]["type"] == "source"
          for m in r["affected_models"] for c in m["columns"])
 check("样例-所有路径回到源表", ok)
 
@@ -318,7 +330,7 @@ check("EXISTS-条件污染全输出",
       {c["column"] for c in m["columns"]} == {"id", "val"})
 check("EXISTS-谓词类型标注",
       any(step.get("predicate") == "EXISTS"
-          for c in m["columns"] for step in c["path"]))
+          for c in m["columns"] for step in expand(r, c)))
 check("EXISTS-条件查询名",
       any("EXISTS" in q for q in m["condition_queries"]), str(m["condition_queries"]))
 
@@ -359,8 +371,68 @@ m5 = next(m for m in r["affected_models"] if m["model"] == "m5")
 check("diamond-汇合模型全列污染",
       {c["column"] for c in m5["columns"]} == {"uid", "vflag"})
 check("diamond-路径均回源",
-      all(c["path"][0]["type"] == "source" and c["path"][0]["column"] == "flag"
+      all(expand(r, c)[0]["type"] == "source" and expand(r, c)[0]["column"] == "flag"
           for c in m5["columns"]))
+
+# 28. 1200 层长链：逐层引用时完整列出受影响列，共用前缀只保留一份 --------------------------
+def make_chain(n, reverse_names=False):
+    # reverse_names=True 时依赖方向与模型名排序相反（旧实现在此触发递归深度错误）
+    def name(i):
+        return f"a{n + 1 - i:04d}" if reverse_names else f"chain_{i:04d}"
+    models = [{
+        "name": name(1),
+        "sql": "SELECT t.id AS id, t.flag AS flag FROM t_a t",
+    }]
+    for i in range(2, n + 1):
+        models.append({
+            "name": name(i),
+            "sql": f"SELECT p.id AS id, p.flag AS flag FROM {name(i - 1)} p",
+        })
+    return {"source_tables": base_sources(), "models": models}
+
+
+for rev in (False, True):
+    p = make_chain(1200, reverse_names=rev)
+    build_models(p)  # 校验不报错（旧实现在 rev=True 时 RecursionError）
+    r = analyze(p, "t_a", "flag")
+    tag = f"长链1200(rev={rev})"
+    check(f"{tag}-全部模型受影响", r["model_count"] == 1200, str(r["model_count"]))
+    check(f"{tag}-全部列受影响", r["column_count"] == 1200, str(r["column_count"]))
+    # 共用前缀只保留一份：步骤数 = 源表 1 步 + 每个污染列 1 步，而非逐列重复携带
+    check(f"{tag}-步骤数线性", len(r["path_steps"]) == 1201, str(len(r["path_steps"])))
+    last_flag = next(c for c in r["affected_models"][-1]["columns"] if c["column"] == "flag")
+    path = expand(r, last_flag)
+    check(f"{tag}-末列路径完整回源",
+          len(path) == 1201 and path[0]["type"] == "source" and path[0]["column"] == "flag",
+          str(len(path)))
+
+# 29. 长链中的循环：仍指出环上的模型（不触发递归深度限制） --------------------------------
+p = make_chain(1500, reverse_names=True)
+p["models"] += [
+    {"name": "zz_loop", "sql": "SELECT x.flag AS flag FROM zz_loop2 x"},
+    {"name": "zz_loop2", "sql": "SELECT y.flag AS flag FROM zz_loop y"},
+]
+try:
+    build_models(p)
+    check("长链循环-报错", False)
+except AnalysisError as e:
+    check("长链循环-报错",
+          "循环" in str(e) and "zz_loop" in str(e) and "zz_loop2" in str(e), str(e))
+
+# 30. 共用前缀：diamond 两条路径共用同一份源表步骤与上游模型步骤 ----------------------------
+p = make_payload([
+    {"name": "m1", "sql": "SELECT a.id AS id, a.flag AS flag FROM t_a a WHERE a.flag = 1"},
+    {"name": "m3", "sql": "SELECT x.id AS id, x.flag AS flag FROM m1 x"},
+    {"name": "m4", "sql": "SELECT y.id AS id, y.flag AS flag FROM m1 y"},
+    {"name": "m5", "sql":
+     "SELECT u.id AS uid, v.flag AS vflag FROM m3 u INNER JOIN m4 v ON u.id = v.id"},
+])
+r = analyze(p, "t_a", "flag")
+# 源表 1 步 + m1/m3/m4/m5 各 2 个污染列 = 9 步；逐列重复携带时为 24 步
+check("共用前缀-步骤登记表去重", len(r["path_steps"]) == 9, str(len(r["path_steps"])))
+m5 = next(m for m in r["affected_models"] if m["model"] == "m5")
+src_ids = {expand(r, c)[0]["id"] for c in m5["columns"]}
+check("共用前缀-两条路径共用同一源表步骤", len(src_ids) == 1, str(src_ids))
 
 print()
 if FAILURES:

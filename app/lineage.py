@@ -495,24 +495,42 @@ def build_models(payload: dict) -> tuple[dict[str, list[str]], dict[str, ModelIn
 
 
 def _topological_order(infos: dict[str, ModelInfo]) -> list[str]:
+    """迭代式拓扑排序：长依赖链（上千层）不会触发递归深度限制。
+
+    发现循环时仍抛出 AnalysisError，并列出环上的模型。
+    """
     order: list[str] = []
     state: dict[str, int] = {}  # 0=未访问 1=访问中 2=完成
 
-    def visit(name: str, stack: list[str]) -> None:
-        s = state.get(name, 0)
-        if s == 2:
-            return
-        if s == 1:
-            cycle = " -> ".join(stack[stack.index(name):] + [name])
-            raise AnalysisError(f"模型依赖存在循环：{cycle}，本工具仅支持有向无环的模型血缘。")
-        state[name] = 1
-        for up in sorted(infos[name].upstream):
-            visit(up, stack + [name])
-        state[name] = 2
-        order.append(name)
-
-    for name in sorted(infos):
-        visit(name, [])
+    for start in sorted(infos):
+        if state.get(start, 0) != 0:
+            continue
+        state[start] = 1
+        # stack 即当前 DFS 路径；iters 记录每个节点尚未遍历的上游
+        stack = [start]
+        iters = {start: iter(sorted(infos[start].upstream))}
+        while stack:
+            top = stack[-1]
+            descended = False
+            for up in iters[top]:
+                s = state.get(up, 0)
+                if s == 2:
+                    continue
+                if s == 1:
+                    cycle = " -> ".join(stack[stack.index(up):] + [up])
+                    raise AnalysisError(
+                        f"模型依赖存在循环：{cycle}，本工具仅支持有向无环的模型血缘。"
+                    )
+                state[up] = 1
+                stack.append(up)
+                iters[up] = iter(sorted(infos[up].upstream))
+                descended = True
+                break
+            if not descended:
+                state[top] = 2
+                order.append(top)
+                stack.pop()
+                del iters[top]
     return order
 
 
@@ -520,14 +538,74 @@ def _topological_order(infos: dict[str, ModelInfo]) -> list[str]:
 # 污染传播
 # ---------------------------------------------------------------------------
 
+class PathRegistry:
+    """依赖路径步骤登记表：多条路径共用的前缀只保存一份。
+
+    每个步骤是一个 dict，含 id 与 prev（前一步骤的下标，源表步骤为 None）；
+    一条完整路径由“最后一步的下标”表示，沿 prev 回溯即可还原。
+    长依赖链（如 1200 个模型逐层引用）下，分析与传输的体积均为 O(链长)，
+    而不是逐列重复携带同一段上游路径的 O(链长²)。
+    """
+
+    def __init__(self) -> None:
+        self.steps: list[dict] = []
+        # path_via[i]：以下标 i 结尾的整条路径的依赖方式汇总
+        # （value/condition/mixed；源表起点尚无传递，记 None）
+        self.path_via: list[str | None] = []
+        self._source_ids: dict[tuple[str, str], int] = {}
+
+    def add_source(self, relation: str, column: str) -> int:
+        """登记源表字段起点；同一源字段全局只保留一份。"""
+        key = (relation, column)
+        idx = self._source_ids.get(key)
+        if idx is not None:
+            return idx
+        idx = len(self.steps)
+        self.steps.append({
+            "id": idx,
+            "type": "source",
+            "relation": relation,
+            "column": column,
+            "prev": None,
+        })
+        self.path_via.append(None)
+        self._source_ids[key] = idx
+        return idx
+
+    def add_step(self, step: dict, via: str, prev: int | None) -> int:
+        idx = len(self.steps)
+        step["id"] = idx
+        step["prev"] = prev
+        self.steps.append(step)
+        base = self.path_via[prev] if prev is not None else None
+        if base is None or base == via:
+            self.path_via.append(via)
+        else:
+            self.path_via.append("mixed")
+        return idx
+
+    def expand(self, path_id: int) -> list[dict]:
+        """把路径下标还原为完整步骤列表（源表字段在前，供测试/调试）。"""
+        out: list[dict] = []
+        cur: int | None = path_id
+        while cur is not None:
+            step = self.steps[cur]
+            out.append({k: v for k, v in step.items() if k not in ("id", "prev")})
+            cur = step["prev"]
+        out.reverse()
+        return out
+
+
 def _propagate_within_model(info: ModelInfo,
                             incoming: dict[str, set[str]],
-                            upstream_paths: dict[str, dict[str, list[dict]]]) -> dict[str, list[dict]]:
+                            upstream_paths: dict[str, dict[str, int]],
+                            registry: PathRegistry) -> dict[str, int]:
     """在单个模型内部做定点传播。
 
     incoming: 上游模型名 -> 被污染的上游输出列集合
-    upstream_paths: 上游模型根输出列 -> 完整依赖路径（用于跨模型串联）
-    返回：本模型根查询每个被污染输出列 -> 一条依赖路径
+    upstream_paths: 上游模型名 -> (根输出列 -> 路径最后一步的下标)
+    registry: 全局路径步骤登记表（跨模型共用前缀）
+    返回：本模型根查询每个被污染输出列 -> 路径最后一步的下标
     """
     nodes = info.nodes  # traverse_scope 后序：被依赖的 CTE/子查询在前
     by_name = info.by_name
@@ -587,34 +665,43 @@ def _propagate_within_model(info: ModelInfo,
         for n in nodes
     )
 
-    # 为每个污染输出列记录一条依赖路径
-    paths = _build_paths(info, upstream_paths)
+    # 为每个污染输出列记录一条依赖路径（登记到全局表，共用前缀）
+    paths = _build_paths(info, upstream_paths, registry)
     return paths
 
 
 def _build_paths(info: ModelInfo,
-                 upstream_paths: dict[str, dict[str, list[dict]]]) -> dict[str, list[dict]]:
+                 upstream_paths: dict[str, dict[str, int]],
+                 registry: PathRegistry) -> dict[str, int]:
     """为根查询每个污染输出列构造一条回溯到源表字段的依赖路径。
 
-    upstream_paths: 上游模型名 -> (该模型根输出列 -> 完整路径)。
+    upstream_paths: 上游模型名 -> (该模型根输出列 -> 路径最后一步的下标)。
     路径由“步骤”组成，每一步描述一个查询节点中 输入列 -> 输出列 的传递，
     via 标记该步是值依赖(value)还是条件污染(condition)。
+    步骤登记到全局 PathRegistry：同一查询节点同一列只生成一步，
+    多条路径共用的前缀（含跨模型的上游路径）只保存一份。
+    返回：根输出列 -> 路径最后一步的下标。
     """
     by_name = info.by_name
     by_id = {n.node_id: n for n in info.nodes}
+    memo: dict[tuple[str, str], int | None] = {}
+    visiting: set[tuple[str, str]] = set()
 
-    def find_path(node: QueryNode, col: str, seen: frozenset) -> list[dict] | None:
+    def find_step(node: QueryNode, col: str) -> int | None:
         key = (node.node_id, col)
-        if key in seen:
+        if key in memo:
+            return memo[key]
+        if key in visiting:
             return None
-        seen = seen | {key}
+        visiting.add(key)
+        try:
+            result = _find_step(node, col)
+        finally:
+            visiting.discard(key)
+        memo[key] = result
+        return result
 
-        step = {
-            "type": "node",
-            "model": info.name,
-            "query": node.name,
-            "output": col,
-        }
+    def _find_step(node: QueryNode, col: str) -> int | None:
         cond_leaf_hit = bool(node.predicate_leaves & node.tainted_leaves)
         value_leaves = [lf for lf in node.output_leaves[col] if lf in node.tainted_leaves]
 
@@ -628,29 +715,29 @@ def _build_paths(info: ModelInfo,
 
         for leaf, via in ordered:
             stype, actual = node.sources[leaf.relation]
-            cur = dict(step)
-            cur.update({
+            step = {
+                "type": "node",
+                "model": info.name,
+                "query": node.name,
+                "output": col,
                 "via": via,
                 "input_relation": actual,
                 "input_qualifier": leaf.relation,
                 "input_column": leaf.column,
-            })
+            }
             if stype in ("cte", "subquery"):
                 up = by_name[actual]
                 if leaf.column in up.tainted_outputs:
-                    sub = find_path(up, leaf.column, seen)
-                    if sub is not None:
-                        return sub + [cur]
+                    prev = find_step(up, leaf.column)
+                    if prev is not None:
+                        return registry.add_step(step, via, prev)
             elif stype == "model":
-                up_paths = upstream_paths.get(actual, {})
-                if leaf.column in up_paths:
-                    return up_paths[leaf.column] + [cur]
+                prev = upstream_paths.get(actual, {}).get(leaf.column)
+                if prev is not None:
+                    return registry.add_step(step, via, prev)
             else:  # 源表：路径起点
-                return [{
-                    "type": "source",
-                    "relation": actual,
-                    "column": leaf.column,
-                }, cur]
+                src = registry.add_source(actual, leaf.column)
+                return registry.add_step(step, via, src)
 
         # 条件污染经由 IN/EXISTS 谓词子查询：穿过子查询的任一污染输出
         for sid in node.predicate_subqueries:
@@ -659,29 +746,37 @@ def _build_paths(info: ModelInfo,
             for sub_col in sub_node.output_columns:
                 if sub_col not in sub_node.tainted_outputs:
                     continue
-                sub_path = find_path(sub_node, sub_col, seen)
-                if sub_path is not None:
-                    cur = dict(step)
-                    cur.update({
+                prev = find_step(sub_node, sub_col)
+                if prev is not None:
+                    step = {
+                        "type": "node",
+                        "model": info.name,
+                        "query": node.name,
+                        "output": col,
                         "via": "condition",
                         "input_relation": sub_node.name,
                         "input_qualifier": sub_node.name,
                         "input_column": sub_col,
                         "predicate": pred_kind,
-                    })
-                    return sub_path + [cur]
+                    }
+                    return registry.add_step(step, "condition", prev)
         return None
 
     root = info.nodes[-1]
-    result: dict[str, list[dict]] = {}
+    result: dict[str, int] = {}
     for col in root.output_columns:
         if col not in root.tainted_outputs:
             continue
-        path = find_path(root, col, frozenset())
-        if path is None:
-            path = [{"type": "node", "model": info.name, "query": root.name,
-                     "output": col, "via": "unknown"}]
-        result[col] = path
+        path_id = find_step(root, col)
+        if path_id is None:
+            path_id = registry.add_step({
+                "type": "node",
+                "model": info.name,
+                "query": root.name,
+                "output": col,
+                "via": "unknown",
+            }, "unknown", None)
+        result[col] = path_id
     return result
 
 
@@ -697,8 +792,9 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
 
     # 跨模型传播：incoming[model] = {上游模型: 污染输出列}
     incoming: dict[str, dict[str, set[str]]] = {name: {} for name in infos}
-    # 每个模型根输出列 -> 完整依赖路径（供下游模型串联）
-    all_paths: dict[str, dict[str, list[dict]]] = {}
+    # 每个模型根输出列 -> 路径最后一步的下标（供下游模型串联，共用前缀）
+    all_paths: dict[str, dict[str, int]] = {}
+    registry = PathRegistry()
 
     for name in order:
         info = infos[name]
@@ -729,7 +825,7 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
                        for lf in all_leaves):
                     node.tainted_leaves.add(Leaf(relation=sname, column=target_column))
 
-        paths = _propagate_within_model(info, incoming[name], all_paths)
+        paths = _propagate_within_model(info, incoming[name], all_paths, registry)
         if paths:
             all_paths[name] = paths
 
@@ -743,12 +839,13 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
         for col in root.output_columns:
             if col not in root.tainted_outputs:
                 continue
-            path = all_paths.get(name, {}).get(col, [])
-            via = _summarize_via(path)
+            path_id = all_paths.get(name, {}).get(col)
+            if path_id is None:
+                continue
             cols.append({
                 "column": col,
-                "via": via,
-                "path": path,
+                "via": registry.path_via[path_id] or "value",
+                "path_id": path_id,
             })
         # 条件污染判定（根查询或任一内部查询命中条件，含 IN 谓词子查询）
         by_id = {n.node_id: n for n in info.nodes}
@@ -767,17 +864,9 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
     return {
         "target": {"table": target_table, "column": target_column},
         "affected_models": affected,
+        # 路径步骤登记表：columns[].path_id 指向最后一步，沿 prev 回溯还原；
+        # 多条路径共用的前缀只传输一份
+        "path_steps": registry.steps,
         "model_count": len(affected),
         "column_count": sum(len(m["columns"]) for m in affected),
     }
-
-
-def _summarize_via(path: list[dict]) -> str:
-    if not path:
-        return "unknown"
-    vias = {step.get("via") for step in path if "via" in step}
-    if "condition" in vias and "value" in vias:
-        return "mixed"
-    if "condition" in vias:
-        return "condition"
-    return "value"
